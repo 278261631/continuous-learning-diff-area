@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import sys
+import time
 
 import numpy as np
 from astropy.io import fits
@@ -10,11 +11,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QPushButton,
     QSpinBox,
@@ -91,17 +90,30 @@ def pnorm(img, lo_pct, hi_pct):
     return float(vmin), float(vmax)
 
 
+class RunData:
+    def __init__(self, run_dir):
+        self.run_dir = run_dir
+        with open(os.path.join(run_dir, RUN_MARKER), encoding="utf-8") as f:
+            self.done = json.load(f)
+        self.template_path = self.done.get("template_file")
+        self.target_files = sorted(glob.glob(os.path.join(run_dir, TARGET_GLOB)))
+        self.target_path = self.target_files[0] if self.target_files else None
+        csv_path = os.path.join(run_dir, CSV_NAME)
+        self.rows = load_csv(csv_path) if os.path.exists(csv_path) else []
+        self.label = os.path.basename(run_dir)
+
+
 class ViewerWindow(QMainWindow):
     def __init__(self, start_dir=None):
         super().__init__()
         self.setWindowTitle("FITS Train-Data Viewer")
         self.resize(1500, 900)
 
-        self.done = None
+        self.run_datas = []
+        self.all_entries = []
+        self.current_fits_run = None
         self.template_hdul = None
         self.target_hdul = None
-        self.rows = []
-        self.runs = []
 
         self._build_ui()
         self.statusBar().showMessage("Open a train-data folder to begin.")
@@ -119,19 +131,8 @@ class ViewerWindow(QMainWindow):
         btn_open.clicked.connect(self.choose_folder)
         toolbar.addWidget(btn_open)
 
-        toolbar.addWidget(QLabel("Run:"))
-        self.run_combo = QComboBox()
-        self.run_combo.setMinimumWidth(280)
-        self.run_combo.currentIndexChanged.connect(self._on_run_changed)
-        toolbar.addWidget(self.run_combo)
-
-        toolbar.addWidget(QLabel("Target fit:"))
-        self.tgt_combo = QComboBox()
-        self.tgt_combo.setMinimumWidth(200)
-        self.tgt_combo.currentIndexChanged.connect(self._on_tgt_changed)
-        toolbar.addWidget(self.tgt_combo)
-
         toolbar.addStretch(1)
+
         toolbar.addWidget(QLabel("Half-size (px):"))
         self.half_spin = QSpinBox()
         self.half_spin.setRange(5, 1000)
@@ -158,47 +159,38 @@ class ViewerWindow(QMainWindow):
         self.share_scale.toggled.connect(lambda _: self.update_plot())
         toolbar.addWidget(self.share_scale)
 
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItem("All")
-        self.filter_combo.addItem("skip_flag = 0")
-        self.filter_combo.addItem("skip_flag != 0")
-        self.filter_combo.currentIndexChanged.connect(self._refilter)
-        toolbar.addWidget(QLabel("Filter:"))
-        toolbar.addWidget(self.filter_combo)
-
         btn_prev = QPushButton("< Prev")
         btn_prev.clicked.connect(lambda: self._step(-1))
         toolbar.addWidget(btn_prev)
-
-        self.rank_edit = QLineEdit()
-        self.rank_edit.setFixedWidth(70)
-        self.rank_edit.returnPressed.connect(self._jump_to_rank)
-        toolbar.addWidget(QLabel("Rank:"))
-        toolbar.addWidget(self.rank_edit)
 
         btn_next = QPushButton("Next >")
         btn_next.clicked.connect(lambda: self._step(1))
         toolbar.addWidget(btn_next)
 
+        btn_export = QPushButton("Export all images")
+        btn_export.clicked.connect(self.export_current)
+        toolbar.addWidget(btn_export)
+
         root_layout.addLayout(toolbar)
 
         splitter = QSplitter(Qt.Horizontal)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["rank", "x", "y", "n_frames", "median_flux", "nearest_ref_px", "ra_deg", "dec_deg"]
+            ["run", "rank", "x", "y", "n_frames", "median_flux", "nearest_ref_px", "ra_deg", "dec_deg"]
         )
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.currentCellChanged.connect(lambda *_: self.update_plot())
+        self.table.setColumnWidth(0, 260)
         self.table.horizontalHeader().setStretchLastSection(True)
         splitter.addWidget(self.table)
 
         self.fig = Figure(figsize=(10, 8), tight_layout=True)
         self.canvas = FigureCanvasQTAgg(self.fig)
         splitter.addWidget(self.canvas)
-        splitter.setSizes([420, 1080])
+        splitter.setSizes([500, 1000])
 
         root_layout.addWidget(splitter)
 
@@ -211,95 +203,45 @@ class ViewerWindow(QMainWindow):
             self.open_folder(d)
 
     def open_folder(self, path):
-        self.runs = collect_runs(path)
-        if not self.runs:
+        run_dirs = collect_runs(path)
+        if not run_dirs:
             self.statusBar().showMessage(
                 f"No run found in {path}: need {RUN_MARKER} + {TARGET_GLOB} + {CSV_NAME}"
             )
             return
-        self.run_combo.blockSignals(True)
-        self.run_combo.clear()
-        for r in self.runs:
-            self.run_combo.addItem(os.path.relpath(r, path) if r != path else os.path.basename(path) or path)
-        self.run_combo.blockSignals(False)
-        self._load_run(self.runs[0])
 
-    def _on_run_changed(self, idx):
-        if 0 <= idx < len(self.runs):
-            self._load_run(self.runs[idx])
+        self.run_datas = []
+        self.all_entries = []
+        skipped = 0
+        for run_dir in run_dirs:
+            rd = RunData(run_dir)
+            if (
+                not rd.template_path
+                or not os.path.exists(rd.template_path)
+                or not rd.target_path
+                or not rd.rows
+            ):
+                skipped += 1
+                continue
+            self.run_datas.append(rd)
+            for rec in rd.rows:
+                self.all_entries.append({"run": rd, "rec": rec})
 
-    def _load_run(self, run_dir):
-        done_path = os.path.join(run_dir, RUN_MARKER)
-        with open(done_path, encoding="utf-8") as f:
-            self.done = json.load(f)
-
-        self.template_path = self.done.get("template_file")
-        if not self.template_path or not os.path.exists(self.template_path):
-            self.statusBar().showMessage(
-                f"Template not found: {self.template_path!r} (set in {done_path})"
-            )
+        if not self.run_datas:
+            self.statusBar().showMessage(f"No usable run found under {path} (template/target/csv missing).")
             return
 
-        self.tgt_files = sorted(glob.glob(os.path.join(run_dir, TARGET_GLOB)))
-        if not self.tgt_files:
-            self.statusBar().showMessage(f"No {TARGET_GLOB} in {run_dir}")
-            return
-
-        self.tgt_combo.blockSignals(True)
-        self.tgt_combo.clear()
-        for t in self.tgt_files:
-            self.tgt_combo.addItem(os.path.basename(t), t)
-        self.tgt_combo.blockSignals(False)
-
-        csv_path = os.path.join(run_dir, CSV_NAME)
-        if not os.path.exists(csv_path):
-            self.statusBar().showMessage(f"Missing {CSV_NAME} in {run_dir}")
-            return
-        self.all_rows = load_csv(csv_path)
-
-        self._open_fits(self.template_path, self.tgt_files[0])
-        self._refilter()
+        self._fill_table()
         self.statusBar().showMessage(
-            f"Run: {run_dir} | template: {os.path.basename(self.template_path)} | "
-            f"target: {os.path.basename(self.tgt_files[0])} | candidates: {len(self.rows)}"
+            f"Runs: {len(self.run_datas)} (skipped {skipped}), candidates: {len(self.all_entries)}"
         )
 
-    def _on_tgt_changed(self):
-        path = self.tgt_combo.currentData()
-        if path and self.template_path:
-            self._open_fits(self.template_path, path)
-
-    def _open_fits(self, template_path, target_path):
-        if self.template_hdul is not None:
-            self.template_hdul.close()
-        if self.target_hdul is not None:
-            self.target_hdul.close()
-        self.template_hdul = fits.open(template_path, memmap=True)
-        self.target_hdul = fits.open(target_path, memmap=True)
-        self.update_plot()
-
-    # --------------------------------------------------------------- filtering
-    def _refilter(self):
-        if not getattr(self, "all_rows", None):
-            return
-        mode = self.filter_combo.currentIndex()
-        self.rows = []
-        for rec in self.all_rows:
-            try:
-                flag = int(float(rec.get("skip_flag", "0")))
-            except (TypeError, ValueError):
-                flag = 0
-            if mode == 1 and flag != 0:
-                continue
-            if mode == 2 and flag == 0:
-                continue
-            self.rows.append(rec)
-        self._fill_table()
-
     def _fill_table(self):
-        self.table.setRowCount(len(self.rows))
-        for i, rec in enumerate(self.rows):
+        self.table.setRowCount(len(self.all_entries))
+        for i, e in enumerate(self.all_entries):
+            rec = e["rec"]
             vals = [
+                e["run"].label,
                 rec.get("rank", ""),
                 rec.get("x", ""),
                 rec.get("y", ""),
@@ -311,22 +253,37 @@ class ViewerWindow(QMainWindow):
             ]
             for j, v in enumerate(vals):
                 self.table.setItem(i, j, QTableWidgetItem(str(v)))
-        if self.rows:
+        if self.all_entries:
             self.table.setCurrentCell(0, 0)
+
+    # ------------------------------------------------------------------ fits
+    def _switch_fits(self, rd):
+        if self.template_hdul is not None:
+            self.template_hdul.close()
+        if self.target_hdul is not None:
+            self.target_hdul.close()
+        self.template_hdul = fits.open(rd.template_path, memmap=True)
+        self.target_hdul = fits.open(rd.target_path, memmap=True)
+        self.current_fits_run = rd
 
     # ---------------------------------------------------------------- plotting
     def update_plot(self):
-        if self.template_hdul is None or self.target_hdul is None:
+        if not self.all_entries:
             return
         row = self.table.currentRow()
-        if row < 0 or row >= len(self.rows):
+        if row < 0 or row >= len(self.all_entries):
             return
-        rec = self.rows[row]
+        e = self.all_entries[row]
+        rd = e["run"]
+        rec = e["rec"]
         try:
             cx = float(rec["x"])
             cy = float(rec["y"])
         except (KeyError, ValueError):
             return
+
+        if self.current_fits_run is not rd:
+            self._switch_fits(rd)
 
         half = self.half_spin.value()
         t_img = cutout(self.template_hdul[0].data, cx, cy, half)
@@ -347,19 +304,19 @@ class ViewerWindow(QMainWindow):
         axes = self.fig.subplots(1, 3, sharex=True, sharey=True)
 
         extent = [cx - half, cx + half, cy - half, cy + half]
-        titles = ["Template\n" + os.path.basename(self.template_path),
-                  "Target (.02rp.fit)\n" + os.path.basename(self.tgt_combo.currentText()),
-                  "Target - Template"]
+        titles = [
+            "Template\n" + os.path.basename(rd.template_path),
+            "Target (.02rp.fit)\n" + os.path.basename(rd.target_path),
+            "Target - Template",
+        ]
         for ax, img, lim, title in zip(axes, [t_img, g_img, diff], [t_lim, g_lim, None], titles):
-            if title.startswith("Target - Template"):
+            if title == "Target - Template":
                 fin = diff[np.isfinite(diff)]
                 q = np.percentile(np.abs(fin), 95) if fin.size else 0.0
                 v = max(float(q), 1e-12)
-                im = ax.imshow(img, origin="lower", extent=extent, cmap="RdBu_r",
-                               vmin=-v, vmax=v)
+                im = ax.imshow(img, origin="lower", extent=extent, cmap="RdBu_r", vmin=-v, vmax=v)
             else:
-                im = ax.imshow(img, origin="lower", extent=extent, cmap="gray",
-                               vmin=lim[0], vmax=lim[1])
+                im = ax.imshow(img, origin="lower", extent=extent, cmap="gray", vmin=lim[0], vmax=lim[1])
             ax.plot(cx, cy, "+", color="red", markersize=12, markeredgewidth=1.5)
             ax.set_title(title, fontsize=9)
             self.fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -368,12 +325,73 @@ class ViewerWindow(QMainWindow):
         axes[0].set_ylabel("y (px)")
 
         info = (
-            f"rank={rec.get('rank')}  x={cx:.2f}  y={cy:.2f}  "
+            f"{rd.label}  rank={rec.get('rank')}  x={cx:.2f}  y={cy:.2f}  "
             f"flux={rec.get('median_flux_norm')}  nearest_ref_px={rec.get('nearest_ref_dist_px')}  "
-            f"ra={rec.get('ra_deg')}  dec={rec.get('dec_deg')}  skip={rec.get('skip_flag')}"
+            f"ra={rec.get('ra_deg')}  dec={rec.get('dec_deg')}"
         )
         self.fig.suptitle(info, fontsize=11)
         self.canvas.draw()
+
+    # ---------------------------------------------------------------- export
+    def export_current(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.all_entries):
+            self.statusBar().showMessage("Select a candidate row first.", 3000)
+            return
+        rd = self.all_entries[row]["run"]
+        entries = [e for e in self.all_entries if e["run"] is rd]
+
+        out_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "output_" + time.strftime("%Y%m%d_%H%M%S"),
+        )
+        os.makedirs(out_dir, exist_ok=True)
+
+        self._switch_fits(rd)
+        half = self.half_spin.value()
+        lo = self.vmin_spin.value()
+        hi = self.vmax_spin.value()
+        shared = self.share_scale.isChecked()
+
+        for e in entries:
+            rec = e["rec"]
+            cx, cy = float(rec["x"]), float(rec["y"])
+            t_img = cutout(self.template_hdul[0].data, cx, cy, half)
+            g_img = cutout(self.target_hdul[0].data, cx, cy, half)
+            if shared:
+                stack = np.concatenate([t_img.ravel(), g_img.ravel()])
+                vmin, vmax = pnorm(stack, lo, hi)
+                t_lim = g_lim = (vmin, vmax)
+            else:
+                t_lim = pnorm(t_img, lo, hi)
+                g_lim = pnorm(g_img, lo, hi)
+
+            extent = [cx - half, cx + half, cy - half, cy + half]
+            fig = Figure(figsize=(10, 4.6), tight_layout=True)
+            ax1, ax2 = fig.subplots(1, 2, sharex=True, sharey=True)
+            im1 = ax1.imshow(t_img, origin="lower", extent=extent, cmap="gray", vmin=t_lim[0], vmax=t_lim[1])
+            im2 = ax2.imshow(g_img, origin="lower", extent=extent, cmap="gray", vmin=g_lim[0], vmax=g_lim[1])
+            ax1.plot(cx, cy, "+", color="red", markersize=12, markeredgewidth=1.5)
+            ax2.plot(cx, cy, "+", color="red", markersize=12, markeredgewidth=1.5)
+            ax1.set_title("Template\n" + os.path.basename(rd.template_path), fontsize=9)
+            ax2.set_title("Target (.02rp.fit)\n" + os.path.basename(rd.target_path), fontsize=9)
+            ax1.set_xlabel("x (px)")
+            ax1.set_ylabel("y (px)")
+            fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+            fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+            fig.suptitle(
+                f"{rd.label}  rank={rec.get('rank')}  x={cx:.2f}  y={cy:.2f}  "
+                f"flux={rec.get('median_flux_norm')}  ra={rec.get('ra_deg')}  dec={rec.get('dec_deg')}",
+                fontsize=11,
+            )
+            rank = rec.get("rank", "NA")
+            name = f"{rd.label}_rank{rank}_x{int(round(cx))}_y{int(round(cy))}.png"
+            fig.savefig(os.path.join(out_dir, name), dpi=150)
+            fig.clear()
+
+        self.statusBar().showMessage(
+            f"Exported {len(entries)} images for run '{rd.label}' -> {out_dir}"
+        )
 
     # ------------------------------------------------------------- navigation
     def _step(self, delta):
@@ -382,21 +400,6 @@ class ViewerWindow(QMainWindow):
         if 0 <= nr < self.table.rowCount():
             self.table.setCurrentCell(nr, 0)
             self.update_plot()
-
-    def _jump_to_rank(self):
-        try:
-            target = int(self.rank_edit.text().strip())
-        except ValueError:
-            return
-        for i, rec in enumerate(self.rows):
-            try:
-                if int(float(rec.get("rank", "-1"))) == target:
-                    self.table.setCurrentCell(i, 0)
-                    self.update_plot()
-                    return
-            except ValueError:
-                continue
-        self.statusBar().showMessage(f"No candidate with rank {target}", 3000)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Up,):
