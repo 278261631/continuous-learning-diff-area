@@ -343,6 +343,7 @@ class ViewerWindow(QMainWindow):
 
         out_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
+            "output",
             "output_" + time.strftime("%Y%m%d_%H%M%S"),
         )
         os.makedirs(out_dir, exist_ok=True)
@@ -366,31 +367,19 @@ class ViewerWindow(QMainWindow):
                 t_lim = pnorm(t_img, lo, hi)
                 g_lim = pnorm(g_img, lo, hi)
 
-            extent = [cx - half, cx + half, cy - half, cy + half]
-            fig = Figure(figsize=(10, 4.6), tight_layout=True)
-            ax1, ax2 = fig.subplots(1, 2, sharex=True, sharey=True)
-            im1 = ax1.imshow(t_img, origin="lower", extent=extent, cmap="gray", vmin=t_lim[0], vmax=t_lim[1])
-            im2 = ax2.imshow(g_img, origin="lower", extent=extent, cmap="gray", vmin=g_lim[0], vmax=g_lim[1])
-            ax1.plot(cx, cy, "+", color="red", markersize=12, markeredgewidth=1.5)
-            ax2.plot(cx, cy, "+", color="red", markersize=12, markeredgewidth=1.5)
-            ax1.set_title("Template\n" + os.path.basename(rd.template_path), fontsize=9)
-            ax2.set_title("Target (.02rp.fit)\n" + os.path.basename(rd.target_path), fontsize=9)
-            ax1.set_xlabel("x (px)")
-            ax1.set_ylabel("y (px)")
-            fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
-            fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
-            fig.suptitle(
-                f"{rd.label}  rank={rec.get('rank')}  x={cx:.2f}  y={cy:.2f}  "
-                f"flux={rec.get('median_flux_norm')}  ra={rec.get('ra_deg')}  dec={rec.get('dec_deg')}",
-                fontsize=11,
-            )
             rank = rec.get("rank", "NA")
-            name = f"{rd.label}_rank{rank}_x{int(round(cx))}_y{int(round(cy))}.png"
-            fig.savefig(os.path.join(out_dir, name), dpi=150)
-            fig.clear()
+            base = f"{rd.label}_rank{rank}_x{int(round(cx))}_y{int(round(cy))}"
+            for tag, img, lim in (("template", t_img, t_lim), ("target", g_img, g_lim)):
+                fig = Figure(figsize=(6, 6), frameon=False)
+                ax = fig.add_axes([0, 0, 1, 1])
+                ax.set_axis_off()
+                ax.imshow(img, origin="lower", cmap="gray", vmin=lim[0], vmax=lim[1])
+                fig.savefig(os.path.join(out_dir, f"{base}_{tag}.png"), dpi=150,
+                            bbox_inches="tight", pad_inches=0)
+                fig.clear()
 
         self.statusBar().showMessage(
-            f"Exported {len(entries)} images for run '{rd.label}' -> {out_dir}"
+            f"Exported {len(entries) * 2} images (template+target) for run '{rd.label}' -> {out_dir}"
         )
 
     # ------------------------------------------------------------- navigation
