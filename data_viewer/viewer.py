@@ -334,12 +334,9 @@ class ViewerWindow(QMainWindow):
 
     # ---------------------------------------------------------------- export
     def export_current(self):
-        row = self.table.currentRow()
-        if row < 0 or row >= len(self.all_entries):
-            self.statusBar().showMessage("Select a candidate row first.", 3000)
+        if not self.all_entries:
+            self.statusBar().showMessage("No candidates loaded.", 3000)
             return
-        rd = self.all_entries[row]["run"]
-        entries = [e for e in self.all_entries if e["run"] is rd]
 
         out_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -348,38 +345,50 @@ class ViewerWindow(QMainWindow):
         )
         os.makedirs(out_dir, exist_ok=True)
 
-        self._switch_fits(rd)
         half = self.half_spin.value()
         lo = self.vmin_spin.value()
         hi = self.vmax_spin.value()
         shared = self.share_scale.isChecked()
 
-        for e in entries:
-            rec = e["rec"]
-            cx, cy = float(rec["x"]), float(rec["y"])
-            t_img = cutout(self.template_hdul[0].data, cx, cy, half)
-            g_img = cutout(self.target_hdul[0].data, cx, cy, half)
-            if shared:
-                stack = np.concatenate([t_img.ravel(), g_img.ravel()])
-                vmin, vmax = pnorm(stack, lo, hi)
-                t_lim = g_lim = (vmin, vmax)
-            else:
-                t_lim = pnorm(t_img, lo, hi)
-                g_lim = pnorm(g_img, lo, hi)
+        by_run = {}
+        for e in self.all_entries:
+            by_run.setdefault(e["run"], []).append(e)
 
-            rank = rec.get("rank", "NA")
-            base = f"{rd.label}_rank{rank}_x{int(round(cx))}_y{int(round(cy))}"
-            for tag, img, lim in (("template", t_img, t_lim), ("target", g_img, g_lim)):
-                fig = Figure(figsize=(6, 6), frameon=False)
-                ax = fig.add_axes([0, 0, 1, 1])
-                ax.set_axis_off()
-                ax.imshow(img, origin="lower", cmap="gray", vmin=lim[0], vmax=lim[1])
-                fig.savefig(os.path.join(out_dir, f"{base}_{tag}.png"), dpi=150,
-                            bbox_inches="tight", pad_inches=0)
-                fig.clear()
+        total = 0
+        for rd, entries in by_run.items():
+            if not (rd.template_path and os.path.exists(rd.template_path) and rd.target_path):
+                continue
+            self._switch_fits(rd)
+            for e in entries:
+                rec = e["rec"]
+                cx, cy = float(rec["x"]), float(rec["y"])
+                t_img = cutout(self.template_hdul[0].data, cx, cy, half)
+                g_img = cutout(self.target_hdul[0].data, cx, cy, half)
+                if shared:
+                    stack = np.concatenate([t_img.ravel(), g_img.ravel()])
+                    vmin, vmax = pnorm(stack, lo, hi)
+                    t_lim = g_lim = (vmin, vmax)
+                else:
+                    t_lim = pnorm(t_img, lo, hi)
+                    g_lim = pnorm(g_img, lo, hi)
+
+                rank = rec.get("rank", "NA")
+                base = f"{rd.label}_rank{rank}_x{int(round(cx))}_y{int(round(cy))}"
+                npx = t_img.shape[0]
+                dpi = 150
+                for tag, img, lim in (("template", t_img, t_lim), ("target", g_img, g_lim)):
+                    fig = Figure(figsize=(npx / dpi, npx / dpi), frameon=False)
+                    ax = fig.add_axes([0, 0, 1, 1])
+                    ax.set_axis_off()
+                    ax.imshow(img, origin="lower", cmap="gray", vmin=lim[0], vmax=lim[1],
+                              interpolation="nearest")
+                    fig.savefig(os.path.join(out_dir, f"{base}_{tag}.png"), dpi=dpi,
+                                bbox_inches="tight", pad_inches=0)
+                    fig.clear()
+                total += 2
 
         self.statusBar().showMessage(
-            f"Exported {len(entries) * 2} images (template+target) for run '{rd.label}' -> {out_dir}"
+            f"Exported {total} images for all {len(by_run)} runs -> {out_dir}"
         )
 
     # ------------------------------------------------------------- navigation
