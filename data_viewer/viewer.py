@@ -1,5 +1,6 @@
 import csv
 import glob
+import importlib.util
 import json
 import os
 import sys
@@ -30,6 +31,14 @@ from matplotlib.figure import Figure
 RUN_MARKER = ".done.json"
 TARGET_GLOB = "*.02rp.fit"
 CSV_NAME = "variable_candidates_nonref_only_inner_border.csv"
+
+TR_MODEL_PATH = r"E:\github\simulate_astro_images\train_and_data\models_tr\best.pt"
+TR_CLASS_NAMES = ("new", "brighten", "move")
+TR_CLASS_COLORS = {0: "red", 1: "orange", 2: "magenta"}
+TR_AVAILABLE = (
+    importlib.util.find_spec("torch") is not None
+    and importlib.util.find_spec("cv2") is not None
+)
 
 
 def is_run_dir(path):
@@ -114,6 +123,10 @@ class ViewerWindow(QMainWindow):
         self.current_fits_run = None
         self.template_hdul = None
         self.target_hdul = None
+        self.tr_net = None
+        self.tr_size = 256
+        self.tr_model_path = TR_MODEL_PATH
+        self.tr_torch = None
 
         self._build_ui()
         self.statusBar().showMessage("Open a train-data folder to begin.")
@@ -170,6 +183,18 @@ class ViewerWindow(QMainWindow):
         btn_export = QPushButton("Export all images")
         btn_export.clicked.connect(self.export_current)
         toolbar.addWidget(btn_export)
+
+        self.tr_check = QCheckBox("Run TR model")
+        self.tr_check.setEnabled(TR_AVAILABLE)
+        if not TR_AVAILABLE:
+            self.tr_check.setToolTip("torch / opencv-python not installed")
+        self.tr_check.toggled.connect(lambda _: self.update_plot())
+        toolbar.addWidget(self.tr_check)
+
+        btn_tr = QPushButton("TR ckpt...")
+        btn_tr.setEnabled(TR_AVAILABLE)
+        btn_tr.clicked.connect(self.choose_tr_model)
+        toolbar.addWidget(btn_tr)
 
         root_layout.addLayout(toolbar)
 
@@ -300,17 +325,22 @@ class ViewerWindow(QMainWindow):
             g_lim = pnorm(g_img, lo, hi)
 
         diff = g_img - t_img
+        tr = None
+        if self.tr_check.isChecked():
+            tr = self._run_tr_panel(t_img, g_img)
+
         self.fig.clear()
-        axes = self.fig.subplots(1, 3, sharex=True, sharey=True)
+        ncols = 4 if tr is not None else 3
+        axes = list(self.fig.subplots(1, ncols, sharex=True, sharey=True).flatten())
 
         extent = [cx - half, cx + half, cy - half, cy + half]
-        titles = [
-            "Template\n" + os.path.basename(rd.template_path),
-            "Target (.02rp.fit)\n" + os.path.basename(rd.target_path),
-            "Target - Template",
+        panels = [
+            (t_img, t_lim, "Template\n" + os.path.basename(rd.template_path), "gray"),
+            (g_img, g_lim, "Target (.02rp.fit)\n" + os.path.basename(rd.target_path), "gray"),
+            (diff, None, "Target - Template", "diff"),
         ]
-        for ax, img, lim, title in zip(axes, [t_img, g_img, diff], [t_lim, g_lim, None], titles):
-            if title == "Target - Template":
+        for ax, (img, lim, title, kind) in zip(axes, panels):
+            if kind == "diff":
                 fin = diff[np.isfinite(diff)]
                 q = np.percentile(np.abs(fin), 95) if fin.size else 0.0
                 v = max(float(q), 1e-12)
@@ -329,8 +359,108 @@ class ViewerWindow(QMainWindow):
             f"flux={rec.get('median_flux_norm')}  nearest_ref_px={rec.get('nearest_ref_dist_px')}  "
             f"ra={rec.get('ra_deg')}  dec={rec.get('dec_deg')}"
         )
+        if tr is not None:
+            self._draw_tr_panel(axes[3], g_img, g_lim, tr, extent, half, cx, cy)
+            info += (
+                f"\nTR: dx={tr['dx']:+.2f} dy={tr['dy']:+.2f} "
+                f"droll={tr['roll']:+.2f}\u00b0  peaks={len(tr['peaks'])}"
+            )
         self.fig.suptitle(info, fontsize=11)
         self.canvas.draw()
+
+    # ------------------------------------------------------------------ tr model
+    def choose_tr_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select TR checkpoint", os.path.dirname(self.tr_model_path),
+            "PyTorch checkpoint (*.pt);;All files (*)"
+        )
+        if path:
+            self.tr_model_path = path
+            self.tr_net = None
+            self.tr_check.setChecked(True)
+            self.update_plot()
+
+    def _load_tr_model(self):
+        if self.tr_net is not None:
+            return True
+        try:
+            import torch
+            from tr_model import build_model_from_state
+            obj = torch.load(self.tr_model_path, map_location="cpu")
+            sd = obj["model"] if isinstance(obj, dict) and "model" in obj else obj
+            self.tr_net = build_model_from_state(sd)
+            self.tr_size = int(obj.get("model_in", 256)) if isinstance(obj, dict) else 256
+            self.tr_torch = torch
+            return True
+        except Exception as exc:
+            self.tr_net = None
+            self.statusBar().showMessage(f"TR model load failed: {exc}", 5000)
+            return False
+
+    @staticmethod
+    def _cutout_to_u8(img):
+        fin = img[np.isfinite(img)]
+        if fin.size == 0:
+            return np.zeros(img.shape, dtype=np.uint8)
+        lo, hi = np.percentile(fin, [1.0, 99.5])
+        if hi - lo <= 1e-6:
+            lo, hi = float(np.nanmin(fin)), float(np.nanmax(fin))
+        if hi - lo <= 1e-6:
+            return np.zeros(img.shape, dtype=np.uint8)
+        x = (np.nan_to_num(img, nan=lo) - lo) / (hi - lo)
+        return np.clip(x * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    def _run_tr_panel(self, t_img, g_img):
+        if not self._load_tr_model():
+            return None
+        try:
+            import cv2
+            from tr_model import decode, heat_to_peaks, preprocess
+            # FITS cutouts are displayed origin="lower"; flip to image
+            # convention (row 0 = top) before feeding the model.
+            a = self._cutout_to_u8(t_img)[::-1]
+            b = self._cutout_to_u8(g_img)[::-1]
+            size = self.tr_size
+            a = cv2.resize(a, (size, size), interpolation=cv2.INTER_AREA)
+            b = cv2.resize(b, (size, size), interpolation=cv2.INTER_AREA)
+            pair = preprocess(a, b).unsqueeze(0)
+            with self.tr_torch.no_grad():
+                pose, det = self.tr_net(pair)
+                dx, dy, roll = decode(pose)[0].tolist()
+                if det is not None:
+                    prob = self.tr_torch.sigmoid(det)
+                    peaks = heat_to_peaks(prob)[0]
+                    heat = prob[0].numpy()
+                else:
+                    peaks, heat = [], None
+            return {"dx": float(dx), "dy": float(dy), "roll": float(roll),
+                    "peaks": peaks, "heat": heat, "size": size}
+        except Exception as exc:
+            self.statusBar().showMessage(f"TR inference failed: {exc}", 5000)
+            return None
+
+    def _draw_tr_panel(self, ax, g_img, g_lim, tr, extent, half, cx, cy):
+        ax.imshow(g_img, origin="lower", extent=extent, cmap="gray",
+                  vmin=g_lim[0], vmax=g_lim[1])
+        heat = tr["heat"]
+        if heat is not None and heat.size:
+            pmax = heat.max(axis=0)[::-1]
+            im = ax.imshow(pmax, origin="lower", extent=extent, cmap="jet",
+                           alpha=0.45, vmin=0.0, vmax=max(0.2, float(pmax.max())))
+            self.fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        scale = tr["size"] / float(2 * half + 1)
+        for cl, x, y, sc in tr["peaks"]:
+            xa = (cx - half) + x / scale
+            ya = (cy + half) - y / scale
+            color = TR_CLASS_COLORS.get(cl, "white")
+            ax.plot(xa, ya, "o", mfc="none", mec=color, markersize=10,
+                    markeredgewidth=1.5)
+            name = TR_CLASS_NAMES[cl] if 0 <= cl < len(TR_CLASS_NAMES) else str(cl)
+            ax.annotate(name, (xa, ya), color=color, fontsize=7)
+        ax.plot(cx, cy, "+", color="red", markersize=12, markeredgewidth=1.5)
+        ax.set_title(
+            f"TR model\npredict dx={tr['dx']:+.2f} dy={tr['dy']:+.2f} "
+            f"droll={tr['roll']:+.2f}\u00b0", fontsize=9)
 
     # ---------------------------------------------------------------- export
     def export_current(self):

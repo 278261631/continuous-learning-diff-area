@@ -2,3 +2,7 @@ PySide6>=6.5
 numpy>=1.24
 astropy>=5.0
 matplotlib>=3.7
+
+# Optional: enable the "Run TR model" checkbox (PairRegNet inference)
+# torch>=2.0
+# opencv-python>=4.5
