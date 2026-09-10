@@ -330,8 +330,10 @@ class ViewerWindow(QMainWindow):
             tr = self._run_tr_panel(t_img, g_img)
 
         self.fig.clear()
-        ncols = 4 if tr is not None else 3
-        axes = list(self.fig.subplots(1, ncols, sharex=True, sharey=True).flatten())
+        n_panels = 4 if tr is not None else 3
+        rows, cols = self._grid_shape(n_panels)
+        axes = list(self.fig.subplots(rows, cols, sharex=True, sharey=True,
+                                      squeeze=False).flatten())
 
         extent = [cx - half, cx + half, cy - half, cy + half]
         panels = [
@@ -365,6 +367,15 @@ class ViewerWindow(QMainWindow):
                 f"\nTR: dx={tr['dx']:+.2f} dy={tr['dy']:+.2f} "
                 f"droll={tr['roll']:+.2f}\u00b0  peaks={len(tr['peaks'])}"
             )
+            if tr.get("conf") is not None:
+                conf_txt = "  ".join(
+                    f"{TR_CLASS_NAMES[i]}={v:.2f}" if 0 <= i < len(TR_CLASS_NAMES)
+                    else f"cls{i}={v:.2f}"
+                    for i, v in enumerate(tr["conf"])
+                )
+                info += f"  [conf max: {conf_txt}]"
+        for ax in axes[n_panels:]:
+            ax.set_axis_off()
         self.fig.suptitle(info, fontsize=11)
         self.canvas.draw()
 
@@ -431,10 +442,11 @@ class ViewerWindow(QMainWindow):
                     prob = self.tr_torch.sigmoid(det)
                     peaks = heat_to_peaks(prob)[0]
                     heat = prob[0].numpy()
+                    conf = heat.max(axis=(1, 2)).tolist()
                 else:
-                    peaks, heat = [], None
+                    peaks, heat, conf = [], None, None
             return {"dx": float(dx), "dy": float(dy), "roll": float(roll),
-                    "peaks": peaks, "heat": heat, "size": size}
+                    "peaks": peaks, "heat": heat, "size": size, "conf": conf}
         except Exception as exc:
             self.statusBar().showMessage(f"TR inference failed: {exc}", 5000)
             return None
@@ -456,11 +468,29 @@ class ViewerWindow(QMainWindow):
             ax.plot(xa, ya, "o", mfc="none", mec=color, markersize=10,
                     markeredgewidth=1.5)
             name = TR_CLASS_NAMES[cl] if 0 <= cl < len(TR_CLASS_NAMES) else str(cl)
-            ax.annotate(name, (xa, ya), color=color, fontsize=7)
+            ax.annotate(f"{name} {sc:.2f}", (xa, ya), color=color, fontsize=7)
         ax.plot(cx, cy, "+", color="red", markersize=12, markeredgewidth=1.5)
         ax.set_title(
             f"TR model\npredict dx={tr['dx']:+.2f} dy={tr['dy']:+.2f} "
             f"droll={tr['roll']:+.2f}\u00b0", fontsize=9)
+
+    @staticmethod
+    def _grid_shape(n, aspect=10.0 / 8.0):
+        """Pick (rows, cols) so square cutouts render as large as possible.
+
+        The figure is wider than tall (aspect = W/H), so a single row leaves
+        lots of vertical whitespace and tiny panels. Search every column count
+        and keep the grid whose square cell is biggest.
+        """
+        best = (1, n)
+        best_side = -1.0
+        for cols in range(1, n + 1):
+            rows = (n + cols - 1) // cols
+            side = min(aspect / cols, 1.0 / rows)
+            if side > best_side:
+                best_side = side
+                best = (rows, cols)
+        return best
 
     # ---------------------------------------------------------------- export
     def export_current(self):
