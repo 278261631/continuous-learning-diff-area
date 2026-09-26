@@ -32,9 +32,9 @@ RUN_MARKER = ".done.json"
 TARGET_GLOB = "*.02rp.fit"
 CSV_NAME = "variable_candidates_nonref_only_inner_border.csv"
 
-TR_MODEL_PATH = r"E:\github\simulate_astro_images\train_and_data\models_tr\best.pt"
-TR_CLASS_NAMES = ("new", "brighten", "move")
-TR_CLASS_COLORS = {0: "red", 1: "orange", 2: "magenta"}
+TR_MODEL_PATH = r"E:\github\simulate_astro_images\train_and_data\models_256\best.pt"
+TR_CLASS_NAMES = ("appear", "satellite")
+TR_CLASS_COLORS = {0: "red", 1: "orange"}
 TR_AVAILABLE = (
     importlib.util.find_spec("torch") is not None
     and importlib.util.find_spec("cv2") is not None
@@ -436,7 +436,7 @@ class ViewerWindow(QMainWindow):
             b = cv2.resize(b, (size, size), interpolation=cv2.INTER_AREA)
             pair = preprocess(a, b).unsqueeze(0)
             with self.tr_torch.no_grad():
-                pose, det = self.tr_net(pair)
+                pose, det, ob = self.tr_net(pair)
                 dx, dy, roll = decode(pose)[0].tolist()
                 if det is not None:
                     prob = self.tr_torch.sigmoid(det)
@@ -445,8 +445,10 @@ class ViewerWindow(QMainWindow):
                     conf = heat.max(axis=(1, 2)).tolist()
                 else:
                     peaks, heat, conf = [], None, None
+                ob_prob = self.tr_torch.sigmoid(ob)[0].numpy() if ob is not None else None
             return {"dx": float(dx), "dy": float(dy), "roll": float(roll),
-                    "peaks": peaks, "heat": heat, "size": size, "conf": conf}
+                    "peaks": peaks, "heat": heat, "size": size, "conf": conf,
+                    "ob": ob_prob}
         except Exception as exc:
             self.statusBar().showMessage(f"TR inference failed: {exc}", 5000)
             return None
@@ -460,6 +462,12 @@ class ViewerWindow(QMainWindow):
             im = ax.imshow(pmax, origin="lower", extent=extent, cmap="jet",
                            alpha=0.45, vmin=0.0, vmax=max(0.2, float(pmax.max())))
             self.fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ob = tr.get("ob")
+        if ob is not None and ob.size:
+            ob_b = (ob[1] if ob.shape[0] > 1 else ob[0])[::-1]
+            if float(ob_b.max()) > 0.5:
+                ax.contour(ob_b, levels=[0.5], extent=extent, origin="lower",
+                           colors="cyan", linewidths=1.0)
         scale = tr["size"] / float(2 * half + 1)
         for cl, x, y, sc in tr["peaks"]:
             xa = (cx - half) + x / scale
