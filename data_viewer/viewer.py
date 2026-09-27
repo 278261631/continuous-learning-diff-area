@@ -32,9 +32,9 @@ RUN_MARKER = ".done.json"
 TARGET_GLOB = "*.02rp.fit"
 CSV_NAME = "variable_candidates_nonref_only_inner_border.csv"
 
-TR_MODEL_PATH = r"E:\github\simulate_astro_images\train_and_data\models_256\best.pt"
-TR_CLASS_NAMES = ("appear", "satellite")
-TR_CLASS_COLORS = {0: "red", 1: "orange"}
+TR_MODEL_PATH = r"E:\github\simulate_astro_images\train_and_data\models_256_final\best.pt"
+TR_CLASS_NAMES = ("appear",)
+TR_CLASS_COLORS = {0: "red"}
 TR_AVAILABLE = (
     importlib.util.find_spec("torch") is not None
     and importlib.util.find_spec("cv2") is not None
@@ -464,10 +464,13 @@ class ViewerWindow(QMainWindow):
             self.fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         ob = tr.get("ob")
         if ob is not None and ob.size:
-            ob_b = (ob[1] if ob.shape[0] > 1 else ob[0])[::-1]
-            if float(ob_b.max()) > 0.5:
-                ax.contour(ob_b, levels=[0.5], extent=extent, origin="lower",
-                           colors="cyan", linewidths=1.0)
+            # mask channels: [0] A-unusable, [1] B-unusable, [2] B-satellite
+            for ch, color in ((1, "cyan"), (2, "magenta")):
+                if ob.shape[0] > ch:
+                    ch_img = ob[ch][::-1]
+                    if float(ch_img.max()) > 0.5:
+                        ax.contour(ch_img, levels=[0.5], extent=extent,
+                                   origin="lower", colors=color, linewidths=1.0)
         scale = tr["size"] / float(2 * half + 1)
         for cl, x, y, sc in tr["peaks"]:
             xa = (cx - half) + x / scale
